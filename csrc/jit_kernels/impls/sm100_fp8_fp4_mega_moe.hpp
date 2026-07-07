@@ -37,6 +37,8 @@ public:
         // combine reduce dequantizes on the fly. Halves NVLink bytes/token
         // on the second a2a (kHidden + kHidden/128 vs kHidden*2).
         bool use_fp8_combine;
+        // When set, use W8A8 MegaMoE.
+        bool use_fp8_acts;
         MegaMoEConfig config;
 
         // Runtime arguments
@@ -84,6 +86,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -103,7 +106,8 @@ static void __instantiate_kernel() {{
     args.fast_math ? "true" : "false",
     args.use_fp4_acts ? "true" : "false",
     args.use_mxf4_kind ? "true" : "false",
-    args.use_fp8_combine ? "true" : "false");
+    args.use_fp8_combine ? "true" : "false",
+    args.use_fp8_acts ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -142,7 +146,8 @@ static void sm100_fp8_fp4_mega_moe(
     const bool& fast_math,
     const bool& use_fp4_acts = false,
     const bool& use_mxf4_kind = false,
-    const bool& use_fp8_combine = false
+    const bool& use_fp8_combine = false,
+    const bool& use_fp8_acts = false
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -299,6 +304,7 @@ static void sm100_fp8_fp4_mega_moe(
         .use_fp4_acts = use_fp4_acts,
         .use_mxf4_kind = use_mxf4_kind,
         .use_fp8_combine = use_fp8_combine,
+        .use_fp8_acts = use_fp8_acts,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,

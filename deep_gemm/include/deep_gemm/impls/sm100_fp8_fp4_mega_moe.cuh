@@ -65,6 +65,7 @@ template <
     // mainloops); this flag only changes the combine slot's layout +
     // L2 epilogue write-back + combine-reduce read.
     bool kUseFp8Combine = false,
+    bool kUseFp8Acts = false,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -212,9 +213,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     );
 
     // Data types
-    // NOTES: activations are FP8 (e4m3), weights are FP4 (e2m1)
     using a_dtype_t = cutlass::float_e4m3_t;
-    using b_dtype_t = cutlass::detail::float_e2m1_unpacksmem_t;
+    using b_dtype_t = cute::conditional_t<kUseFp8Acts, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t>;
     // Stream A0.2: when `kUseFp4Acts` is on, the L2 phase reads acts as
     // E2M1 instead of E4M3. Both share the same byte footprint in smem
     // (FP8 = 1 B, FP4 unpacksmem = 1 B with `_ALIGN16B` padding), so the
@@ -921,7 +921,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         // alias for source-bytes-summed). Under mxf4 dense FP4,
                         // SMEM_B_SIZE_PER_STAGE halves to `LOAD_BLOCK_N * BLOCK_K / 2`,
                         // so we need `* 2` to get the same source-bytes-summed value.
-                        const uint32_t expect_b_bytes = kUseMxf4Kind
+                        // W8A8:
+                        // expect_tx counts total gmem bytes across multicast targets (=2 for 2-CTA).
+                        // For e2m1 unpacksmem: gmem is packed (0.5B/elem) but smem unpacks to 1B; gmem_bytes_per_cta = SMEM_B/2,
+                        // multicast×2 → total gmem = SMEM_B (the existing constant works as-is by coincidence).
+                        // For e4m3: gmem_bytes_per_cta = SMEM_B (1B/elem), multicast×2 → total = SMEM_B*2.
+                        const uint32_t expect_b_bytes = kUseMxf4Kind || kUseFp8Acts
                             ? SMEM_B_SIZE_PER_STAGE * 2
                             : SMEM_B_SIZE_PER_STAGE;
                         full_barriers[stage_idx]->arrive_and_expect_tx(expect_b_bytes + BLOCK_N * sizeof(uint32_t) * 2);

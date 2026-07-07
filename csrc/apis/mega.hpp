@@ -259,6 +259,7 @@ static void fp8_fp4_mega_moe(
     // FP4-acts / MXF4-kind flags above (those control the dispatch a2a +
     // mainloops; this controls the combine a2a only).
     const bool use_fp8_combine = get_env<int>("DG_USE_FP8_COMBINE") != 0;
+    const bool use_fp8_acts = get_env<int>("DG_MEGA_MOE_USE_FP8_ACTS") != 0;
 
     // Dispatch into different architectures
     if (arch_major == 10) {
@@ -274,7 +275,8 @@ static void fp8_fp4_mega_moe(
                                num_tokens, num_topk,
                                hidden, intermediate_hidden,
                                activation_clamp, fast_math,
-                               use_fp4_acts, use_mxf4_kind, use_fp8_combine);
+                               use_fp4_acts, use_mxf4_kind, use_fp8_combine,
+                               use_fp8_acts);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
