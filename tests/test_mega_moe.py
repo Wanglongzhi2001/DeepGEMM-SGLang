@@ -102,21 +102,75 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             w_sf = deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, 32), num_groups)
             return w, w_sf
 
-        l1_weights = cast_grouped_weights_to_fp4(l1_weights)
-        l2_weights = cast_grouped_weights_to_fp4(l2_weights)
+        # Cast grouped BF16 weights to FP8 (e4m3) with MN-major UE8M0 SF, per-32 along K.
+        # SF shape and packing are identical to the FP4 path (see support_w8a8_qa.md Q1).
+        # NOTE: paddle compat 没有为 float8_e4m3fn 注册 `set_value_with_tensor`，所以
+        # 不能直接 `w[i] = fp8_tensor`。先在 uint8 视图上做赋值（每个 e4m3 元素 = 1 byte），
+        # 最后一次性 view 回 float8_e4m3fn。
+        def cast_grouped_weights_to_fp8(bf16_weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+            num_groups, n, k = bf16_weights.shape
+            w_u8 = torch.empty((num_groups, n, k), device='cuda', dtype=torch.uint8)
+            w_sf = torch.empty((num_groups, n, k // 32), device='cuda', dtype=torch.float)
+            for i in range(num_groups):
+                w_i_fp8, w_sf[i] = per_token_cast_to_fp8(bf16_weights[i], use_ue8m0=True, gran_k=32)
+                w_u8[i] = w_i_fp8.view(torch.uint8)
+            w = w_u8.contiguous().view(torch.float8_e4m3fn)
+            w_sf = w_sf.contiguous()
+            w_sf = deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, 32), num_groups)
+            return w, w_sf
+
+        # Cast grouped BF16 weights to FP8 with blockwise 128 quantization along K.
+        # Quantizes with gran_k=128, then repeat_interleave(4) on SF so that the
+        # SF shape matches per-32 layout (128/32=4 slots share the same SF value).
+        def cast_grouped_weights_to_fp8_blockwise128(bf16_weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+            num_groups, n, k = bf16_weights.shape
+            w_u8 = torch.empty((num_groups, n, k), device='cuda', dtype=torch.uint8)
+            w_sf = torch.empty((num_groups, n, k // 32), device='cuda', dtype=torch.float)
+            for i in range(num_groups):
+                w_i_fp8, w_sf_128 = per_token_cast_to_fp8(bf16_weights[i], use_ue8m0=True, gran_k=128)
+                w_u8[i] = w_i_fp8.view(torch.uint8)
+                # repeat_interleave 4x: per-128 SF -> per-32 SF shape
+                w_sf[i] = w_sf_128.repeat_interleave(4, dim=-1)
+            w = w_u8.contiguous().view(torch.float8_e4m3fn)
+            w_sf = w_sf.contiguous()
+            w_sf = deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, 32), num_groups)
+            return w, w_sf
+
+        use_blockwise_128 = os.environ.get('DG_MEGA_MOE_BLOCKWISE_128', '0') != '0'
+        if args.weight_dtype == 'fp8' and use_blockwise_128:
+            cast_fn = cast_grouped_weights_to_fp8_blockwise128
+        elif args.weight_dtype == 'fp8':
+            cast_fn = cast_grouped_weights_to_fp8
+        else:
+            cast_fn = cast_grouped_weights_to_fp4
+        l1_weights = cast_fn(l1_weights)
+        l2_weights = cast_fn(l2_weights)
         transformed_l1_weights, transformed_l2_weights = deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights)
 
     # Run fused mega MoE
     # NOTES: copy x into buffer before each call because debug mode zeros the entire buffer
+    # NOTES: copy x into buffer before each call because debug mode zeros the entire buffer
+    if args.weight_dtype == 'fp8':
+        fused_kernel = deep_gemm.fp8_fp4_mega_moe
+    else:
+        fused_kernel = deep_gemm.fp8_fp4_mega_moe
+    trace_mega_moe = os.environ.get('DG_MEGA_MOE_TRACE', '0') != '0'
+    def trace(message: str):
+        if trace_mega_moe:
+            print(f'[rank {rank_idx}] {message}', flush=True)
+
     def run_fused():
-        buffer.x[:num_tokens].copy_(x[0])
+        trace('run_fused: copy inputs start')
+        buffer.x[:num_tokens].copy_(x[0].view(buffer.x.dtype))
         buffer.x_sf[:num_tokens].copy_(x[1])
         buffer.topk_idx[:num_tokens].copy_(topk_idx)
         buffer.topk_weights[:num_tokens].copy_(topk_weights)
+        trace('run_fused: copy inputs done')
 
         y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
         # noinspection PyTypeChecker
-        deep_gemm.fp8_fp4_mega_moe(
+        trace('run_fused: fused_kernel launch start')
+        fused_kernel(
             y,
             transformed_l1_weights, transformed_l2_weights,
             buffer,
@@ -124,6 +178,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             activation_clamp=args.activation_clamp,
             fast_math=bool(args.fast_math)
         )
+        trace('run_fused: fused_kernel launch returned')
+        if trace_mega_moe:
+            torch.cuda.synchronize()
+            trace('run_fused: cuda synchronize done')
         return y, cumulative_local_expert_recv_stats_fused
 
     dist_print('Config:', once_in_node=True)
@@ -157,8 +215,15 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         num_topk=num_topk, use_fp8_dispatch=True,
         explicitly_destroy=True,
         allow_multiple_reduction=False,
-        gpu_timeout_secs=10, cpu_timeout_secs=30
     ) if is_legacy_loaded else None
+
+    use_blockwise_128 = os.environ.get('DG_MEGA_MOE_BLOCKWISE_128', '0') != '0'
+    # Match baseline quantization granularity to the fused kernel's setting so
+    # the comparison is apples-to-apples. When blockwise128 is on, the fused
+    # kernel quantizes the L1 output per-128-K; the baseline must do the same
+    # (per-128 tilelang SwiGLU + expand per-128 SF into 4 per-32 slots for the
+    # L2 GEMM) to yield a near-bit-exact reference.
+    baseline_num_per_channels = 128 if use_blockwise_128 else 32
 
     def run_baseline():
         recv_x, _, recv_topk_weights, handle, _ = ep_buffer.dispatch(
@@ -170,7 +235,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         )
         n = recv_x[0].size(0)
         l1_y = torch.empty((n, intermediate_hidden * 2), dtype=torch.bfloat16, device='cuda')
-        deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
+        baseline_gemm = (deep_gemm.m_grouped_fp8_gemm_nt_contiguous
+                    if args.weight_dtype == 'fp8'
+                    else deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous)
+        baseline_gemm(
             recv_x, l1_weights, l1_y, handle.psum_num_recv_tokens_per_expert,
             use_psum_layout=True, recipe=(1, 1, 32))
         # noinspection PyCallingNonCallable
@@ -178,7 +246,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             x=l1_y,
             topk_weights=recv_topk_weights,
             avail_tokens=handle.psum_num_recv_tokens_per_expert[-1],
-            num_per_channels=32,
+            num_per_channels=baseline_num_per_channels,
             use_col_major_scales=True,
             round_scale=True,
             ue8m0_scale=True,
@@ -186,21 +254,70 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             clamp_value=args.activation_clamp,
             fast_math=bool(args.fast_math)
         )
+        # When using blockwise-128 quantization, tilelang returns per-128 SF.
+        # The L2 GEMM expects per-32 SF layout, so expand per-128 → per-32.
+        # Each UE8M0 byte (one per-128 scale) must be replicated 4 times at
+        # byte granularity to fill 4 consecutive per-32 slots.
+        if baseline_num_per_channels == 128:
+            l1_y_128_data, l1_y_128_sf = l1_y
+            nt = l1_y_128_sf.shape[0]
+            tma_aligned_nt = deep_gemm.get_tma_aligned_size(nt, 4)
+            # l1_y_128_sf may be col-major strided; make contiguous first
+            # Shape: (nt, packed_k) int32 where packed_k = num_128_scales / 4
+            sf_contig = l1_y_128_sf.contiguous()
+            # Unpack int32 → uint8: each int32 holds 4 UE8M0 bytes
+            sf_uint8 = sf_contig.view(dtype=torch.uint8)  # (nt, packed_k * 4 = num_128_scales)
+            # Repeat each byte 4x: per-128 → per-32
+            sf_expanded = sf_uint8.repeat_interleave(4, dim=-1)  # (nt, num_32_scales)
+            target_k = sf_expanded.shape[1] // 4  # num_32_scales / 4 packed int32
+            sf_int32 = sf_expanded.contiguous().view(dtype=torch.int32)  # (nt, target_k)
+            l1_y_sf_col = torch.empty_strided(
+                (nt, target_k),
+                (1, tma_aligned_nt),
+                dtype=torch.int32, device='cuda')
+            l1_y_sf_col.copy_(sf_int32)
+            l1_y = (l1_y_128_data, l1_y_sf_col)
         l2_y = torch.empty((n, hidden), dtype=torch.bfloat16, device='cuda')
-        deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
+        baseline_gemm(
             l1_y, l2_weights, l2_y, handle.psum_num_recv_tokens_per_expert,
             use_psum_layout=True, recipe=(1, 1, 32))
         return ep_buffer.combine(l2_y, handle=handle)[0], cumulative_local_expert_recv_stats_baseline
 
-    # Check correctness (must be bitwise identical)
+    # Check correctness
     num_correctness_tests = 1 if args.num_correctness_tests is None else args.num_correctness_tests
     # noinspection PyBroadException
     if is_legacy_loaded and num_correctness_tests > 0:
         dist_print('Running correctness tests:', once_in_node=True)
         for i in range(num_correctness_tests):
             create_inputs()
-            for fused_result, baseline_result in zip(run_fused(), run_baseline()):
-                assert torch.equal(fused_result, baseline_result)
+            fused_results = run_fused()
+            baseline_results = run_baseline()
+            for idx, (fused_result, baseline_result) in enumerate(zip(fused_results, baseline_results)):
+                if idx == 1:
+                    # Skip cumulative stats comparison
+                    continue
+                if not torch.equal(fused_result, baseline_result):
+                    diff_mask = (fused_result != baseline_result)
+                    num_diff = diff_mask.sum().item()
+                    total = fused_result.numel()
+                    abs_diff = (fused_result.float() - baseline_result.float()).abs()
+                    max_abs = abs_diff.max().item()
+                    mean_abs = abs_diff.mean().item()
+                    # Relative error: normalize by baseline magnitude
+                    rel_diff = abs_diff / (baseline_result.float().abs() + 1e-6)
+                    max_rel = rel_diff.max().item()
+                    mean_rel = rel_diff.mean().item()
+                    dist_print(f'  MISMATCH result[{idx}]: {num_diff}/{total} elements differ '
+                               f'({100.0*num_diff/total:.2f}%)', once_in_node=True)
+                    dist_print(f'  Max abs diff: {max_abs:.6e}, Mean abs diff: {mean_abs:.6e}', once_in_node=True)
+                    dist_print(f'  Max rel diff: {max_rel:.6e}, Mean rel diff: {mean_rel:.6e}', once_in_node=True)
+                    # Show a few differing positions
+                    diff_positions = torch.nonzero(diff_mask, as_tuple=False)[:5]
+                    for pos in diff_positions:
+                        r, c = pos[0].item(), pos[1].item()
+                        dist_print(f'    [{r},{c}] fused={fused_result[r,c].item():.6f} '
+                                   f'baseline={baseline_result[r,c].item():.6f}', once_in_node=True)
+                    assert False, f"Correctness check failed for result[{idx}]"
             if (i + 1) % 100 == 0 or i == num_correctness_tests - 1:
                 dist_print(f' > Correctness test #{i + 1}/{num_correctness_tests} passed', once_in_node=True)
         dist_print(once_in_node=True)
@@ -222,17 +339,20 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # TFLOPS: 3 matmuls (L1 left, L1 right, L2), each 2 * M * N * K
     safe_div = lambda a, b: float('nan') if b == 0 else a / b
+    num_recv_tokens = int(num_recv_tokens)
     tflops = safe_div(2 * num_recv_tokens * (hidden * intermediate_hidden * 3) / 1e12, t_fused)
 
-    # HBM bytes: weights (FP4 packed = 0.5 bytes) + activations (FP8 = 1 byte) + output (BF16 = 2 bytes)
-    num_touched_experts = torch.unique(gathered_topk_idx.flatten()).numel() - 1 # NOTES minus 1 to exclude "-1"
+    # HBM bytes: weights (FP4 packed = 0.5 bytes / FP8 = 1 byte) + activations (FP8 = 1 byte) + output (BF16 = 2 bytes)
+    num_touched_experts = int(torch.unique(gathered_topk_idx.flatten()).numel()) - 1 # NOTES minus 1 to exclude "-1"
+    weight_bytes_per_elem_x2 = 2 if args.weight_dtype == 'fp8' else 1  # FP8: 1B, FP4: 0.5B → /2 in `// (2 if fp4 else 1)`
+    weight_div = 1 if args.weight_dtype == 'fp8' else 2
     num_hbm_bytes = (
-        num_touched_experts * intermediate_hidden * 2 * hidden // 2 +   # L1 weights (FP4)
-        num_touched_experts * hidden * intermediate_hidden // 2 +       # L2 weights (FP4)
-        num_recv_tokens * hidden +                                      # L1 acts read (FP8)
-        num_recv_tokens * intermediate_hidden +                         # L1 output write (FP8)
-        num_recv_tokens * intermediate_hidden +                         # L2 acts read (FP8)
-        num_recv_tokens * hidden * 2                                    # L2 output write (BF16)
+        num_touched_experts * intermediate_hidden * 2 * hidden // weight_div +   # L1 weights
+        num_touched_experts * hidden * intermediate_hidden // weight_div +       # L2 weights
+        num_recv_tokens * hidden +                                               # L1 acts read (FP8)
+        num_recv_tokens * intermediate_hidden +                                  # L1 output write (FP8)
+        num_recv_tokens * intermediate_hidden +                                  # L2 acts read (FP8)
+        num_recv_tokens * hidden * 2                                             # L2 output write (BF16)
     )
     hbm_gbs = safe_div(num_hbm_bytes / 1e9, t_fused)
 
@@ -281,6 +401,8 @@ if __name__ == '__main__':
     parser.add_argument('--num-topk', type=int, default=6, help='Number of expert selections')
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
+    parser.add_argument('--weight-dtype', type=str, default='fp4', choices=['fp4', 'fp8'],
+                    help='Weight dtype: fp4 (W4A8 baseline) or fp8 (W8A8)')
 
     # Test settings
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')

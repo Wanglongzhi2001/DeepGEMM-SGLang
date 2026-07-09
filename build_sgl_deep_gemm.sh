@@ -141,11 +141,16 @@ print(f"Built {target}")
 PY
 
 echo "--- Installing build frontend ---"
-"$PYTHON_EXE" -m pip install --quiet --upgrade build
+if ! "$PYTHON_EXE" -c "import build" 2>/dev/null; then
+    PIP_EXTRA_INDEX_URL="" PIP_INDEX_URL="" \
+        "$PYTHON_EXE" -m pip install --quiet build \
+        -i http://mirrors.baidubce.com/pypi/simple/ \
+        --trusted-host=mirrors.baidubce.com
+fi
 
 echo "--- Building wheel ---"
 mkdir -p "$DIST_DIR"
-"$PYTHON_EXE" -m build --wheel "$BUILD_DIR" --outdir "$DIST_DIR"
+"$PYTHON_EXE" -m build --wheel --no-isolation "$BUILD_DIR" --outdir "$DIST_DIR"
 
 echo "--- Done ---"
 ls -lh "$DIST_DIR"/sgl_deep_gemm-*.whl 2>/dev/null || ls -lh "$DIST_DIR"/sgl-deep-gemm-*.whl 2>/dev/null || ls -lh "$DIST_DIR"/sgl_deep_gemm*.whl

@@ -22,13 +22,16 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumExpertsPerRank,
           uint32_t kNumExpertsPerWave,
           uint32_t kNumSMs, uint32_t kNumRanks,
+          bool kUseBlockwise128 = false,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
-          uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
+          uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N, // L2_SHAPE_N=hidden
           uint32_t kNumL1BlockKs = L1_SHAPE_K / BLOCK_K,
-          uint32_t kNumL2BlockKs = L2_SHAPE_K / BLOCK_K>
+          uint32_t kNumL2BlockKs = L2_SHAPE_K / BLOCK_K, // L2_SHAPE_K=intermediate_hidden
+          // When kUseBlockwise128, L1 dispatches in pairs (2 consecutive n_blocks per unit)
+          uint32_t kEffectiveL1BlockNs = kUseBlockwise128 ? (kNumL1BlockNs / 2) : kNumL1BlockNs>
 struct MegaMoEScheduler {
-    DG_STATIC_ASSERT(L1_SHAPE_N % BLOCK_N == 0, "Invalid shape");
+    DG_STATIC_ASSERT(L1_SHAPE_N % BLOCK_N == 0, "Invalid shape");/*  */
     DG_STATIC_ASSERT(L2_SHAPE_N % BLOCK_N == 0, "Invalid shape");
     DG_STATIC_ASSERT(L1_SHAPE_K % BLOCK_K == 0, "Invalid shape");
     DG_STATIC_ASSERT(L2_SHAPE_K % BLOCK_K == 0, "Invalid shape");
@@ -117,12 +120,12 @@ struct MegaMoEScheduler {
         const auto wave_end_expert_idx = get_wave_expert_end_idx();
         while (current_local_expert_idx < wave_end_expert_idx) {
             const auto num_m_blocks = get_current_num_m_blocks();
-            m_block_idx = block_idx / kNumL1BlockNs;
+            m_block_idx = block_idx / kEffectiveL1BlockNs;
             if (m_block_idx < num_m_blocks)
                 return true;
 
             // Current expert is fully assigned, move to the next
-            block_idx -= num_m_blocks * kNumL1BlockNs;
+            block_idx -= num_m_blocks * kEffectiveL1BlockNs;
             advance_expert_idx();
         }
         return false;
@@ -153,7 +156,12 @@ struct MegaMoEScheduler {
             if (next_phase == BlockPhase::Linear1) {
                 if (fetch_next_l1_block()) {
                     // Found a new L1 block
-                    n_block_idx = block_idx - m_block_idx * kNumL1BlockNs;
+                    if constexpr (kUseBlockwise128) {
+                        // Pair-based: n_block_idx is the base of a pair (always even)
+                        n_block_idx = (block_idx - m_block_idx * kEffectiveL1BlockNs) * 2;
+                    } else {
+                        n_block_idx = block_idx - m_block_idx * kEffectiveL1BlockNs;
+                    }
                     // Jump to next block
                     block_idx += kNumSMs;
                     return {BlockPhase::Linear1, current_local_expert_idx, m_block_idx, n_block_idx};
@@ -211,9 +219,22 @@ struct MegaMoEScheduler {
             if (block_phase == BlockPhase::None)
                 break;
 
-            func(block_phase, current_local_expert_idx,
-                 block_phase == BlockPhase::Linear2 ? kNumL2BlockKs : kNumL1BlockKs,
-                 m_block_idx, n_block_idx);
+            if constexpr (kUseBlockwise128) {
+                if (block_phase == BlockPhase::Linear1) {
+                    // Pair mode: call func for both n_block_idx and n_block_idx+1
+                    func(block_phase, current_local_expert_idx,
+                         kNumL1BlockKs, m_block_idx, n_block_idx);
+                    func(block_phase, current_local_expert_idx,
+                         kNumL1BlockKs, m_block_idx, n_block_idx + 1);
+                } else {
+                    func(block_phase, current_local_expert_idx,
+                         kNumL2BlockKs, m_block_idx, n_block_idx);
+                }
+            } else {
+                func(block_phase, current_local_expert_idx,
+                     block_phase == BlockPhase::Linear2 ? kNumL2BlockKs : kNumL1BlockKs,
+                     m_block_idx, n_block_idx);
+            }
         }
     }
 };

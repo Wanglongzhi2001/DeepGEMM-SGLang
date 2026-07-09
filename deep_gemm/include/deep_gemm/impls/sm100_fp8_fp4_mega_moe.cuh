@@ -66,6 +66,12 @@ template <
     // L2 epilogue write-back + combine-reduce read.
     bool kUseFp8Combine = false,
     bool kUseFp8Acts = false,
+    // ====== Blockwise 128 quantization — DG_MEGA_MOE_BLOCKWISE_128 ======
+    // When true, the L1 epilogue quantizes SwiGLU outputs with per-128-K
+    // granularity (4 consecutive per-32 groups share one UE8M0 SF). The
+    // scheduler dispatches n_block pairs so both n_blocks needed for a
+    // per-128 group execute on the same SM consecutively.
+    bool kUseBlockwise128 = false,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -303,8 +309,34 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         kNumEpilogueWarpgroups * STORE_BLOCK_M * BLOCK_N * sizeof(nv_bfloat16);
     constexpr uint32_t SMEM_CD_SIZE = SMEM_CD_L1_SIZE > SMEM_CD_L2_SIZE ? SMEM_CD_L1_SIZE : SMEM_CD_L2_SIZE;
     constexpr uint32_t SMEM_CD_L1_SIZE_PER_STAGE = SMEM_CD_L1_SIZE / kNumTMAStoreStages;
+    // ====== Blockwise 128: smem pair staging ======
+    // When `kUseBlockwise128` is on, the L1 epilogue processes n_block pairs.
+    // The first n_block's SwiGLU float results are staged in smem until the
+    // second n_block's amax is available. Size per warpgroup:
+    //   WG_BLOCK_M * L1_OUT_BLOCK_N * sizeof(float)
+    // Plus per-32 amax staging (WG_BLOCK_M / ATOM_M per warpgroup):
+    //   kPairAmaxPerWG * sizeof(float2) per warpgroup
+    constexpr uint32_t SMEM_PAIR_STAGING_FLOAT_SIZE = kUseBlockwise128
+        ? (kNumEpilogueWarpgroups * (BLOCK_M / kNumEpilogueWarpgroups) * (BLOCK_N / 2) * sizeof(float))
+        : 0;
+    // Amax staging: across all store-block iterations within a warpgroup.
+    // Each warp pair stores its own cross-warp-reduced amax, PER LANE (token pair).
+    // Layout: [atom_global][warp_pair(2)][lane(4)] float2
+    //   atom_global = s * kNumAtomsPerStore + i  (in [0, WG_BLOCK_M/ATOM_M))
+    //   index = atom_global * 8 + warp_pair * 4 + lane   (lane in 0..3)
+    // Each lane's float2 = amax for the 2 tokens it owns, so the lane (token)
+    // dimension MUST be part of the index — otherwise the 4 lanes race to the
+    // same slot and 3/4 of tokens' amax are lost (→ FP8 saturation).
+    // Total entries per warpgroup = (WG_BLOCK_M / ATOM_M) * 8 = WG_BLOCK_M.
+    constexpr uint32_t kWGBlockM = BLOCK_M / kNumEpilogueWarpgroups;
+    constexpr uint32_t kPairAmaxPerWG = kWGBlockM;
+    constexpr uint32_t SMEM_PAIR_AMAX_SIZE = kUseBlockwise128
+        ? (kNumEpilogueWarpgroups * kPairAmaxPerWG * sizeof(float2))
+        : 0;
+    constexpr uint32_t SMEM_PAIR_STAGING_SIZE =
+        math::constexpr_align<uint32_t>(SMEM_PAIR_STAGING_FLOAT_SIZE + SMEM_PAIR_AMAX_SIZE, kSharedMemoryAlignment);
     constexpr uint32_t SMEM_BEFORE_BARRIER_SIZE =
-        SMEM_EXPERT_COUNT_SIZE + SMEM_SEND_BUFFER_SIZE + SMEM_CD_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
+        SMEM_EXPERT_COUNT_SIZE + SMEM_SEND_BUFFER_SIZE + SMEM_CD_SIZE + SMEM_PAIR_STAGING_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
     DG_STATIC_ASSERT(SMEM_CD_SIZE % kSharedMemoryAlignment == 0 and
                      SMEM_A_SIZE_PER_STAGE % kSharedMemoryAlignment == 0 and
                      SMEM_B_SIZE_PER_STAGE % kSharedMemoryAlignment == 0,
@@ -337,15 +369,25 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     });
     auto smem_cd_l2 = smem_cd[0];
     auto smem_a = utils::PatternVisitor([=](const uint32_t& i) {
-        return math::advance_ptr<a_dtype_t>(smem_gemm_base, SMEM_CD_SIZE + i * SMEM_A_SIZE_PER_STAGE);
+        return math::advance_ptr<a_dtype_t>(smem_gemm_base, SMEM_CD_SIZE + SMEM_PAIR_STAGING_SIZE + i * SMEM_A_SIZE_PER_STAGE);
     });
     auto smem_b = utils::PatternVisitor([=](const uint32_t& i) {
-        return math::advance_ptr<b_dtype_t>(smem_gemm_base, SMEM_CD_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE + i * SMEM_B_SIZE_PER_STAGE);
+        return math::advance_ptr<b_dtype_t>(smem_gemm_base, SMEM_CD_SIZE + SMEM_PAIR_STAGING_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE + i * SMEM_B_SIZE_PER_STAGE);
     });
+
+    // ====== Blockwise 128: pair staging pointers ======
+    // Float staging buffer for first n_block's SwiGLU output (per warpgroup)
+    // Layout: [kNumEpilogueWarpgroups][WG_BLOCK_M][L1_OUT_BLOCK_N] float
+    auto smem_pair_staging_base = math::advance_ptr<float>(smem_gemm_base,
+        SMEM_CD_SIZE);
+    // Amax staging for first n_block (per warpgroup, per atom)
+    // Layout: [kNumEpilogueWarpgroups][kPairAmaxPerWG] float2
+    auto smem_pair_amax_base = reinterpret_cast<float2*>(
+        reinterpret_cast<uint8_t*>(smem_pair_staging_base) + SMEM_PAIR_STAGING_FLOAT_SIZE);
 
     // SF shared memory: SFA and SFB per pipeline stage
     auto sf_start_ptr = math::advance_ptr<uint8_t>(smem_gemm_base,
-        SMEM_CD_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE));
+        SMEM_CD_SIZE + SMEM_PAIR_STAGING_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE));
     auto smem_sfa = utils::PatternVisitor([=](const uint32_t& i) {
         return reinterpret_cast<uint32_t*>(sf_start_ptr + i * SMEM_SFA_SIZE_PER_STAGE);
     });
@@ -416,7 +458,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank,
         kNumExpertsPerWave,
-        kNumSMs, kNumRanks>(workspace);
+        kNumSMs, kNumRanks,
+        kUseBlockwise128>(workspace);
 
     // MMA pipeline and TMA phases
     uint32_t stage_idx = 0, phase = 0;
@@ -1181,7 +1224,389 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             uint32_t m_idx = pool_block_idx * BLOCK_M;
             uint32_t n_idx = n_block_idx * BLOCK_N;
 
-            if (block_phase == sched::BlockPhase::Linear1) {
+            if (block_phase == sched::BlockPhase::Linear1 and kUseBlockwise128) {
+                // ====== Blockwise 128 L1 epilogue: pair processing ======
+                // Under kUseBlockwise128, for_each_block calls this lambda twice
+                // per pair: first with n_block_idx (even), then with n_block_idx+1 (odd).
+                // Detect first vs second by parity.
+                const bool is_first_of_pair = (n_block_idx % 2 == 0);
+
+                float stored_cached_weight = 0;
+
+                if (is_first_of_pair) {
+                    // ===== First n_block of pair: SwiGLU → stage to smem =====
+                    auto smem_pair_float = smem_pair_staging_base
+                        + epilogue_wg_idx * WG_BLOCK_M * L1_OUT_BLOCK_N;
+                    auto smem_pair_amax = smem_pair_amax_base
+                        + epilogue_wg_idx * kPairAmaxPerWG;
+
+                    #pragma unroll
+                    for (uint32_t s = 0; s < WG_BLOCK_M / STORE_BLOCK_M; ++ s) {
+                        if (epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M >= valid_m) {
+                            ptx::tcgen05_before_thread_sync();
+                            tmem_empty_barriers[accum_stage_idx]->arrive(0u);
+                            break;
+                        }
+
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
+                            const uint32_t j = s * kNumAtomsPerStore + i;
+
+                            // Load topk weights
+                            DG_STATIC_ASSERT(32 % ATOM_M == 0, "Invalid block size");
+                            if ((j * ATOM_M) % 32 == 0 and (WG_BLOCK_M % 32 == 0 or j * ATOM_M + lane_idx < WG_BLOCK_M)) {
+                                stored_cached_weight = *l1_topk_weights_buffer
+                                    .get_data_buffer(m_idx + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + lane_idx)
+                                    .get_base_ptr<float>();
+                            }
+                            const float2 weights = {
+                                ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 0),
+                                ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 1)
+                            };
+
+                            // Load from TMEM
+                            uint32_t tmem_addr = accum_stage_idx * UMMA_N + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M;
+                            uint32_t values[ATOM_M];
+                            cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr,
+                                                                   values[0], values[1], values[2], values[3]);
+                            cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr | 0x00100000,
+                                                                   values[4], values[5], values[6], values[7]);
+                            cutlass::arch::fence_view_async_tmem_load();
+
+                            // Signal TMEM consumed on last atom
+                            if (j == WG_BLOCK_M / ATOM_M - 1) {
+                                ptx::tcgen05_before_thread_sync();
+                                tmem_empty_barriers[accum_stage_idx]->arrive(0u);
+                            }
+
+                            // SwiGLU
+                            auto fp32_values = reinterpret_cast<float*>(values);
+                            float2 swiglu_vals[2];
+                            #pragma unroll
+                            for (uint32_t k = 0; k < 2; ++ k) {
+                                auto bf16_gate = __float22bfloat162_rn(make_float2(fp32_values[k * 4], fp32_values[k * 4 + 1]));
+                                auto bf16_up = __float22bfloat162_rn(make_float2(fp32_values[k * 4 + 2], fp32_values[k * 4 + 3]));
+                                if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity()) {
+                                    bf16_gate = __hmin2(bf16_gate, {kActivationClamp, kActivationClamp});
+                                    bf16_up = __hmax2(bf16_up, {-kActivationClamp, -kActivationClamp});
+                                    bf16_up = __hmin2(bf16_up, {kActivationClamp, kActivationClamp});
+                                }
+                                auto gate = __bfloat1622float2(bf16_gate);
+                                auto neg_gate_exp = make_float2(
+                                    kFastMath ? __expf(-gate.x) : expf(-gate.x),
+                                    kFastMath ? __expf(-gate.y) : expf(-gate.y));
+                                const auto denom = __fadd2_rn({1.0f, 1.0f}, neg_gate_exp);
+                                if constexpr (kFastMath) {
+                                    gate = __fmul2_rn(gate, {math::fast_rcp(denom.x), math::fast_rcp(denom.y)});
+                                } else {
+                                    gate = {gate.x / denom.x, gate.y / denom.y};
+                                }
+                                const auto up = __bfloat1622float2(bf16_up);
+                                swiglu_vals[k] = __fmul2_rn(__fmul2_rn(gate, up), weights);
+                            }
+
+                            // Compute per-32 amax for this atom
+                            float2 atom_amax;
+                            atom_amax.x = math::warp_reduce<4, true>(
+                                cute::max(cute::abs(swiglu_vals[0].x), cute::abs(swiglu_vals[1].x)),
+                                math::ReduceMax<float>());
+                            atom_amax.y = math::warp_reduce<4, true>(
+                                cute::max(cute::abs(swiglu_vals[0].y), cute::abs(swiglu_vals[1].y)),
+                                math::ReduceMax<float>());
+
+                            // Store amax to smem for cross-warp reduction
+                            if (lane_idx < 4)
+                                smem_amax_reduction[epilogue_warp_idx * (STORE_BLOCK_M / 2) + i * (ATOM_M / 2) + lane_idx] = atom_amax;
+                            __syncwarp();
+
+                            // Store SwiGLU float values to pair staging smem
+                            // Layout: [WG_BLOCK_M][L1_OUT_BLOCK_N] per warpgroup
+                            // Each lane writes 4 floats (2 float2) per atom
+                            // Row = s * STORE_BLOCK_M + i * ATOM_M + (lane_idx % 4) * 2 + {0,1}
+                            // Col = warp_idx_in_wg * 16 + (lane_idx / 4) * 2 + {0,1}
+                            // (matches the TMEM_LOAD_16dp256b1x layout mapping)
+                            const uint32_t base_row = s * STORE_BLOCK_M + i * ATOM_M + (lane_idx % 4) * 2;
+                            const uint32_t base_col = warp_idx_in_wg * 16 + (lane_idx / 4) * 2;
+                            smem_pair_float[base_row * L1_OUT_BLOCK_N + base_col] = swiglu_vals[0].x;
+                            smem_pair_float[(base_row + 1) * L1_OUT_BLOCK_N + base_col] = swiglu_vals[0].y;
+                            smem_pair_float[base_row * L1_OUT_BLOCK_N + base_col + 1] = swiglu_vals[1].x;
+                            smem_pair_float[(base_row + 1) * L1_OUT_BLOCK_N + base_col + 1] = swiglu_vals[1].y;
+                        }
+
+                        // Cross-warp amax reduce + store to pair amax staging
+                        __syncwarp();
+                        ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
+                            if ((warp_idx_in_wg % 2) == 0 and lane_idx < 4) {
+                                const float2 wp_amax =
+                                    smem_amax_reduction[(epilogue_warp_idx ^ 1) * (STORE_BLOCK_M / 2) + i * (ATOM_M / 2) + lane_idx % 4];
+                                float2 my_amax =
+                                    smem_amax_reduction[epilogue_warp_idx * (STORE_BLOCK_M / 2) + i * (ATOM_M / 2) + lane_idx % 4];
+                                my_amax.x = cute::max(my_amax.x, wp_amax.x);
+                                my_amax.y = cute::max(my_amax.y, wp_amax.y);
+                                // Store reduced amax per atom / warp-pair / lane (token pair).
+                                // Layout: [atom_global][warp_pair(2)][lane(4)] float2.
+                                // The lane (token) dimension is essential: each lane owns
+                                // a different token pair, so it must have its own slot.
+                                const uint32_t atom_global = s * kNumAtomsPerStore + i;
+                                smem_pair_amax[atom_global * 8 + (warp_idx_in_wg / 2) * 4 + (lane_idx % 4)] = my_amax;
+                            }
+                        }
+                        ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+                    }
+                    // First n_block done — no TMA store, no L2 notify
+                    // Fence to ensure all smem_pair_float/amax writes are visible to
+                    // the second n_block epilogue (same thread, but compiler may reorder)
+                    __threadfence_block();
+                } else {
+                    // ===== Second n_block of pair: SwiGLU → combine amax → quantize both → TMA store =====
+                    auto smem_pair_float = smem_pair_staging_base
+                        + epilogue_wg_idx * WG_BLOCK_M * L1_OUT_BLOCK_N;
+                    auto smem_pair_amax = smem_pair_amax_base
+                        + epilogue_wg_idx * kPairAmaxPerWG;
+
+                    #pragma unroll
+                    for (uint32_t s = 0; s < WG_BLOCK_M / STORE_BLOCK_M; ++ s) {
+                        if (epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M >= valid_m) {
+                            ptx::tcgen05_before_thread_sync();
+                            tmem_empty_barriers[accum_stage_idx]->arrive(0u);
+                            break;
+                        }
+
+                        float2 swiglu_values_second[kNumAtomsPerStore * 2];
+                        float2 amax_values_second[kNumAtomsPerStore];
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
+                            const uint32_t j = s * kNumAtomsPerStore + i;
+
+                            // Load topk weights
+                            if ((j * ATOM_M) % 32 == 0 and (WG_BLOCK_M % 32 == 0 or j * ATOM_M + lane_idx < WG_BLOCK_M)) {
+                                stored_cached_weight = *l1_topk_weights_buffer
+                                    .get_data_buffer(m_idx + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + lane_idx)
+                                    .get_base_ptr<float>();
+                            }
+                            const float2 weights = {
+                                ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 0),
+                                ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 1)
+                            };
+
+                            // Load from TMEM
+                            uint32_t tmem_addr = accum_stage_idx * UMMA_N + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M;
+                            uint32_t values[ATOM_M];
+                            cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr,
+                                                                   values[0], values[1], values[2], values[3]);
+                            cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr | 0x00100000,
+                                                                   values[4], values[5], values[6], values[7]);
+                            cutlass::arch::fence_view_async_tmem_load();
+
+                            // Signal TMEM consumed on last atom
+                            if (j == WG_BLOCK_M / ATOM_M - 1) {
+                                ptx::tcgen05_before_thread_sync();
+                                tmem_empty_barriers[accum_stage_idx]->arrive(0u);
+                            }
+
+                            // SwiGLU for second n_block
+                            auto fp32_values = reinterpret_cast<float*>(values);
+                            #pragma unroll
+                            for (uint32_t k = 0; k < 2; ++ k) {
+                                auto bf16_gate = __float22bfloat162_rn(make_float2(fp32_values[k * 4], fp32_values[k * 4 + 1]));
+                                auto bf16_up = __float22bfloat162_rn(make_float2(fp32_values[k * 4 + 2], fp32_values[k * 4 + 3]));
+                                if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity()) {
+                                    bf16_gate = __hmin2(bf16_gate, {kActivationClamp, kActivationClamp});
+                                    bf16_up = __hmax2(bf16_up, {-kActivationClamp, -kActivationClamp});
+                                    bf16_up = __hmin2(bf16_up, {kActivationClamp, kActivationClamp});
+                                }
+                                auto gate = __bfloat1622float2(bf16_gate);
+                                auto neg_gate_exp = make_float2(
+                                    kFastMath ? __expf(-gate.x) : expf(-gate.x),
+                                    kFastMath ? __expf(-gate.y) : expf(-gate.y));
+                                const auto denom = __fadd2_rn({1.0f, 1.0f}, neg_gate_exp);
+                                if constexpr (kFastMath) {
+                                    gate = __fmul2_rn(gate, {math::fast_rcp(denom.x), math::fast_rcp(denom.y)});
+                                } else {
+                                    gate = {gate.x / denom.x, gate.y / denom.y};
+                                }
+                                const auto up = __bfloat1622float2(bf16_up);
+                                swiglu_values_second[i * 2 + k] = __fmul2_rn(__fmul2_rn(gate, up), weights);
+                            }
+
+                            // Per-32 amax for second n_block
+                            amax_values_second[i].x = math::warp_reduce<4, true>(
+                                cute::max(cute::abs(swiglu_values_second[i * 2 + 0].x), cute::abs(swiglu_values_second[i * 2 + 1].x)),
+                                math::ReduceMax<float>());
+                            amax_values_second[i].y = math::warp_reduce<4, true>(
+                                cute::max(cute::abs(swiglu_values_second[i * 2 + 0].y), cute::abs(swiglu_values_second[i * 2 + 1].y)),
+                                math::ReduceMax<float>());
+                            if (lane_idx < 4)
+                                smem_amax_reduction[epilogue_warp_idx * (STORE_BLOCK_M / 2) + i * (ATOM_M / 2) + lane_idx] = amax_values_second[i];
+                            __syncwarp();
+                        }
+
+                        // Wait TMA store from previous iteration + fence smem_amax_reduction
+                        const uint32_t tma_stage_idx = s % kNumTMAStoreStages;
+                        ptx::tma_store_wait<kNumTMAStoreStages - 1>();
+                        ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+
+                        // Cross-warp reduce for second n_block + combine with first n_block's amax
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
+                            // After sync_aligned, all 4 warps' smem entries for second n_block are visible.
+                            // Read all 4 warps within THIS warpgroup to get the max across all 64 columns.
+                            const uint32_t wg_warp_base = epilogue_wg_idx * 4;
+                            float2 second_amax_all = smem_amax_reduction[(wg_warp_base + 0) * (STORE_BLOCK_M / 2) + i * (ATOM_M / 2) + lane_idx % 4];
+                            #pragma unroll
+                            for (uint32_t w = 1; w < 4; ++ w) {
+                                const float2 other = smem_amax_reduction[(wg_warp_base + w) * (STORE_BLOCK_M / 2) + i * (ATOM_M / 2) + lane_idx % 4];
+                                second_amax_all.x = cute::max(second_amax_all.x, other.x);
+                                second_amax_all.y = cute::max(second_amax_all.y, other.y);
+                            }
+                            // Store cross-reduced amax back for use in second STSM loop
+                            amax_values_second[i] = second_amax_all;
+
+                            // Load first n_block's amax from pair staging (both warp pairs)
+                            // Indexed per lane (token pair): [atom_global][warp_pair][lane]
+                            const uint32_t atom_global = s * kNumAtomsPerStore + i;
+                            const float2 amax_first_wp0 = smem_pair_amax[atom_global * 8 + 0 * 4 + (lane_idx % 4)];
+                            const float2 amax_first_wp1 = smem_pair_amax[atom_global * 8 + 1 * 4 + (lane_idx % 4)];
+
+                            // Combine: per-128 amax per TOKEN = max of all 4 per-32 groups
+                            const float amax_128_x = cute::max(
+                                cute::max(amax_first_wp0.x, amax_first_wp1.x), second_amax_all.x);
+                            const float amax_128_y = cute::max(
+                                cute::max(amax_first_wp0.y, amax_first_wp1.y), second_amax_all.y);
+
+                            // Calculate per-128 SF (per-token)
+                            float2 sf_128, sf_inv_128;
+                            const float2 amax_for_sf = {amax_128_x, amax_128_y};
+                            math::get_e4m3_sf_and_sf_inv(amax_for_sf, sf_128, sf_inv_128);
+
+                            // ---- Quantize first n_block (from smem staging) ----
+                            const uint32_t base_row_first = s * STORE_BLOCK_M + i * ATOM_M + (lane_idx % 4) * 2;
+                            const uint32_t base_col_first = warp_idx_in_wg * 16 + (lane_idx / 4) * 2;
+                            const float2 first_upper = {
+                                smem_pair_float[base_row_first * L1_OUT_BLOCK_N + base_col_first] * sf_inv_128.x,
+                                smem_pair_float[(base_row_first + 1) * L1_OUT_BLOCK_N + base_col_first] * sf_inv_128.y
+                            };
+                            const float2 first_lower = {
+                                smem_pair_float[base_row_first * L1_OUT_BLOCK_N + base_col_first + 1] * sf_inv_128.x,
+                                smem_pair_float[(base_row_first + 1) * L1_OUT_BLOCK_N + base_col_first + 1] * sf_inv_128.y
+                            };
+                            const auto fp8x4_first = __nv_fp8x4_e4m3(make_float4(first_upper.x, first_upper.y, first_lower.x, first_lower.y));
+
+                            // STSM for first n_block
+                            {
+                                uint32_t row = lane_idx;
+                                uint32_t col = warp_idx_in_wg;
+                                const auto smem_ptr = smem_cd[tma_stage_idx] + epilogue_wg_idx * STORE_BLOCK_M * L1_OUT_BLOCK_N
+                                                                             + i * ATOM_M * L1_OUT_BLOCK_N
+                                                                             + row * L1_OUT_BLOCK_N
+                                                                             + (col ^ (row / 2)) * kNumBankGroupBytes;
+                                ptx::SM100_U8x4_STSM_T<__nv_fp8x4_e4m3>::copy(fp8x4_first, smem_ptr);
+                            }
+
+                            // Store SF to `l2_sf_buffer` — 4 consecutive k_idx positions get same SF
+                            // SF for first n_block's 2 per-32 groups + second n_block's 2 per-32 groups
+                            if (warp_idx_in_wg % 2 == 0 and lane_idx < 4) {
+                                const uint32_t pair_base_n = n_block_idx - 1;  // first n_block of pair
+                                // 4 per-32 k_idx positions: pair_base_n*2+0, pair_base_n*2+1, n_block_idx*2+0, n_block_idx*2+1
+                                const uint32_t k_idx_base = pair_base_n * 2 + warp_idx_in_wg / 2;
+                                // This warp pair writes 2 of the 4 positions (its own warp_pair k_idx from each n_block)
+                                // First n_block's position: k_idx_base
+                                // Second n_block's position: k_idx_base + 2
+                                const auto write_sf_at_k = [&](const uint32_t k_idx) {
+                                    const uint32_t k_uint_idx = k_idx / 4, byte_idx = k_idx % 4;
+                                    const uint32_t mn_stride = kNumPaddedSFPoolTokens * sizeof(uint32_t);
+                                    const auto sf_base_ptr = l2_sf_buffer.get_base_ptr<uint8_t>();
+                                    const uint32_t token_base_idx = epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M;
+                                    __builtin_assume(token_base_idx < BLOCK_M);
+                                    const auto sf_pool_token_idx = scheduler.get_current_pool_block_offset() * SF_BLOCK_M
+                                        + m_block_idx * SF_BLOCK_M + transform_sf_token_idx(token_base_idx) + (lane_idx * 2) * 4;
+                                    const auto sf_addr = k_uint_idx * mn_stride + sf_pool_token_idx * static_cast<uint32_t>(sizeof(uint32_t)) + byte_idx;
+                                    sf_base_ptr[sf_addr] =
+                                        (*reinterpret_cast<const uint32_t*>(&sf_128.x) >> 23);
+                                    sf_base_ptr[sf_addr + 4 * static_cast<uint32_t>(sizeof(uint32_t))] =
+                                        (*reinterpret_cast<const uint32_t*>(&sf_128.y) >> 23);
+                                };
+                                write_sf_at_k(k_idx_base);       // first n_block's k_idx
+                                write_sf_at_k(k_idx_base + 2);   // second n_block's k_idx
+                            }
+                            __syncwarp();
+                        }
+                        ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+
+                        // TMA store for first n_block
+                        if (warp_idx_in_wg == 0 and cute::elect_one_sync()) {
+                            const uint32_t out_n_idx_first = (n_block_idx - 1) * L1_OUT_BLOCK_N;
+                            cute::tma_store_fence();
+                            cute::SM90_TMA_STORE_2D::copy(
+                                &tensor_map_l1_output,
+                                smem_cd[tma_stage_idx] + epilogue_wg_idx * STORE_BLOCK_M * L1_OUT_ROW_BYTES,
+                                out_n_idx_first,
+                                m_idx + epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M);
+                            cute::tma_store_arrive();
+                        }
+
+                        // Wait first n_block TMA store, then write second n_block to smem_cd
+                        ptx::tma_store_wait<0>();
+                        ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+
+                        // STSM for second n_block — reuse the same per-128 SF computed above
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
+                            // Recompute per-128 SF (identical to the first loop)
+                            const uint32_t atom_global_r = s * kNumAtomsPerStore + i;
+                            const float2 amax_first_wp0_r = smem_pair_amax[atom_global_r * 8 + 0 * 4 + (lane_idx % 4)];
+                            const float2 amax_first_wp1_r = smem_pair_amax[atom_global_r * 8 + 1 * 4 + (lane_idx % 4)];
+                            const float amax_128_x_r = cute::max(
+                                cute::max(amax_first_wp0_r.x, amax_first_wp1_r.x), amax_values_second[i].x);
+                            const float amax_128_y_r = cute::max(
+                                cute::max(amax_first_wp0_r.y, amax_first_wp1_r.y), amax_values_second[i].y);
+                            float2 sf_128_r, sf_inv_128_r;
+                            const float2 amax_for_sf_r = {amax_128_x_r, amax_128_y_r};
+                            math::get_e4m3_sf_and_sf_inv(amax_for_sf_r, sf_128_r, sf_inv_128_r);
+
+                            const float2 second_upper_2 = __fmul2_rn(swiglu_values_second[i * 2 + 0], sf_inv_128_r);
+                            const float2 second_lower_2 = __fmul2_rn(swiglu_values_second[i * 2 + 1], sf_inv_128_r);
+                            const auto fp8x4_second_2 = __nv_fp8x4_e4m3(make_float4(second_upper_2.x, second_upper_2.y, second_lower_2.x, second_lower_2.y));
+
+                            uint32_t row = lane_idx;
+                            uint32_t col = warp_idx_in_wg;
+                            const auto smem_ptr = smem_cd[tma_stage_idx] + epilogue_wg_idx * STORE_BLOCK_M * L1_OUT_BLOCK_N
+                                                                         + i * ATOM_M * L1_OUT_BLOCK_N
+                                                                         + row * L1_OUT_BLOCK_N
+                                                                         + (col ^ (row / 2)) * kNumBankGroupBytes;
+                            ptx::SM100_U8x4_STSM_T<__nv_fp8x4_e4m3>::copy(fp8x4_second_2, smem_ptr);
+                        }
+                        ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+
+                        // TMA store for second n_block
+                        if (warp_idx_in_wg == 0 and cute::elect_one_sync()) {
+                            const uint32_t out_n_idx_second = n_block_idx * L1_OUT_BLOCK_N;
+                            cute::tma_store_fence();
+                            cute::SM90_TMA_STORE_2D::copy(
+                                &tensor_map_l1_output,
+                                smem_cd[tma_stage_idx] + epilogue_wg_idx * STORE_BLOCK_M * L1_OUT_ROW_BYTES,
+                                out_n_idx_second,
+                                m_idx + epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M);
+                            cute::tma_store_arrive();
+                        }
+                        __syncwarp();
+                    }
+
+                    // Notify L2 for both n_blocks of the pair
+                    ptx::tma_store_wait<0>();
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                        DG_STATIC_ASSERT(L2_SHAPE_K <= 64 * L1_OUT_BLOCK_N, "L2 shape K is too large");
+                        ptx::red_or_rel_gpu(
+                            workspace.get_l2_arrival_mask_ptr(pool_block_idx),
+                            (1ull << (n_block_idx - 1)) | (1ull << n_block_idx)
+                        );
+                    }
+                    __syncwarp();
+                }
+            } else if (block_phase == sched::BlockPhase::Linear1) {
                 // Unified L1 epilogue: SwiGLU in-place using granularity 8 interleaved weights
                 // With `SM100_TMEM_LOAD_16dp256b1x`, gate/up pairs are:
                 //   (values[0], values[2]), (values[1], values[3]),

@@ -137,7 +137,8 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     // Stream A0.5: under `use_mxf4_kind`, A and B smem use the dense FP4
     // layout (`_ALIGN8B`, 2 nibbles/byte). Per-stage byte footprint halves
     // for both A and B → num_stages doubles for the same smem budget.
-    const bool& use_mxf4_kind = false) {
+    const bool& use_mxf4_kind = false,
+    const bool& use_blockwise_128 = false) {
     constexpr int kSmemAlignment = 1024;
     constexpr int kNumEpilogueStages = 2;
     constexpr int kNumTMAStoreStages = 2;
@@ -183,11 +184,23 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     // Fixed total
     const int smem_fixed = smem_dispatch_size + smem_cd + smem_amax_reduction + smem_barriers + smem_tmem_ptr;
 
+    // Blockwise 128: additional smem for pair staging (float SwiGLU + amax)
+    // WG_BLOCK_M = BLOCK_M / num_epilogue_warpgroups holds the full per-warpgroup M tile.
+    // Float staging: [wg][WG_BLOCK_M][BLOCK_N/2] float
+    // Amax staging: [wg][WG_BLOCK_M] float2, layout [atom_global][warp_pair(2)][lane(4)]
+    //   (2 warp pairs * 4 lanes per atom = 8 float2 per atom; WG_BLOCK_M/8 atoms → WG_BLOCK_M)
+    const int wg_block_m = block_m / num_epilogue_warpgroups;
+    const int smem_pair_staging = use_blockwise_128
+        ? align(num_epilogue_warpgroups * wg_block_m * (block_n / 2) * static_cast<int>(sizeof(float))
+                + num_epilogue_warpgroups * wg_block_m * static_cast<int>(sizeof(float) * 2),
+                kSmemAlignment)
+        : 0;
+
     // Select maximum num_stages
-    const int num_stages = (smem_capacity - smem_fixed) / smem_per_stage;
+    const int num_stages = (smem_capacity - smem_fixed - smem_pair_staging) / smem_per_stage;
     DG_HOST_ASSERT(num_stages >= 2);
 
-    return {num_stages, smem_fixed + num_stages * smem_per_stage};
+    return {num_stages, smem_fixed + smem_pair_staging + num_stages * smem_per_stage};
 }
 
 static MegaMoEConfig get_mega_moe_config(
@@ -195,7 +208,8 @@ static MegaMoEConfig get_mega_moe_config(
     const int& num_max_tokens_per_rank, const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const int& num_padded_sf_pool_tokens,
-    const bool& use_mxf4_kind = false) {
+    const bool& use_mxf4_kind = false,
+    const bool& use_blockwise_128 = false) {
     // Block config
     const auto [cluster_size, block_m, store_block_m, num_epilogue_threads] =
         get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, use_mxf4_kind);
@@ -227,7 +241,7 @@ static MegaMoEConfig get_mega_moe_config(
         block_m, block_n, block_k, store_block_m,
         sf_block_m, sf_block_n,
         num_dispatch_threads / 32, num_epilogue_threads / 32,
-        use_mxf4_kind);
+        use_mxf4_kind, use_blockwise_128);
 
     const auto config = MegaMoEConfig {
         block_m, block_n, block_k,

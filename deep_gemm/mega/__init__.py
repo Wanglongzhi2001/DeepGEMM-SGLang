@@ -13,6 +13,19 @@ except Exception as exception:
 from .. import _C
 
 
+def _tvm_tensor_to_torch(t):
+    """Convert a tvm_ffi.core.Tensor to a torch.Tensor via DLPack."""
+    if isinstance(t, torch.Tensor):
+        return t
+    try:
+        return torch.from_dlpack(t)
+    except Exception:
+        # Fallback for older torch versions
+        import tvm_ffi
+        capsule = t._to_dlpack()
+        return torch.utils.dlpack.from_dlpack(capsule)
+
+
 class SymmBuffer:
     def __init__(self, group: dist.ProcessGroup,
                  # MoE arguments
@@ -41,11 +54,12 @@ class SymmBuffer:
         self.group.barrier()
         torch.cuda.synchronize()
 
-        # Create input buffer views
+        # Create input buffer views — convert tvm_ffi Tensors to torch Tensors
+        raw_views = slice_input_buffers(self.buffer)
         (self.x, self.x_sf,
          self.topk_idx, self.topk_weights,
          self.l1_acts, self.l1_acts_sf,
-         self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
+         self.l2_acts, self.l2_acts_sf) = tuple(_tvm_tensor_to_torch(t) for t in raw_views)
 
     def destroy(self):
         self.handle = None

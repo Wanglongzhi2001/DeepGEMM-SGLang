@@ -39,6 +39,8 @@ public:
         bool use_fp8_combine;
         // When set, use W8A8 MegaMoE.
         bool use_fp8_acts;
+        // When set, use blockwise 128 quantization for L1 epilogue activations.
+        bool use_blockwise_128;
         MegaMoEConfig config;
 
         // Runtime arguments
@@ -87,6 +89,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -107,7 +110,8 @@ static void __instantiate_kernel() {{
     args.use_fp4_acts ? "true" : "false",
     args.use_mxf4_kind ? "true" : "false",
     args.use_fp8_combine ? "true" : "false",
-    args.use_fp8_acts ? "true" : "false");
+    args.use_fp8_acts ? "true" : "false",
+    args.use_blockwise_128 ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -147,19 +151,21 @@ static void sm100_fp8_fp4_mega_moe(
     const bool& use_fp4_acts = false,
     const bool& use_mxf4_kind = false,
     const bool& use_fp8_combine = false,
-    const bool& use_fp8_acts = false
+    const bool& use_fp8_acts = false,
+    const bool& use_blockwise_128 = false
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_padded_sf_pool_tokens = static_cast<int>(l1_acts_sf.size(0));
     // Stream A0.5 sanity: kind::mxf4 only accepts FP4 inputs.
     DG_HOST_ASSERT(not use_mxf4_kind or use_fp4_acts);
+    DG_HOST_ASSERT(not use_blockwise_128 or (use_fp8_acts and not use_fp4_acts));
 
     // Heuristics
     const auto config = get_mega_moe_config(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden, num_padded_sf_pool_tokens,
-        use_mxf4_kind);
+        use_mxf4_kind, use_blockwise_128);
 
     // Make tensormap
     constexpr int kGranK = 32;
@@ -305,6 +311,7 @@ static void sm100_fp8_fp4_mega_moe(
         .use_mxf4_kind = use_mxf4_kind,
         .use_fp8_combine = use_fp8_combine,
         .use_fp8_acts = use_fp8_acts,
+        .use_blockwise_128 = use_blockwise_128,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
