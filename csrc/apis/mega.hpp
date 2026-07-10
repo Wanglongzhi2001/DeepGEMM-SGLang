@@ -260,7 +260,7 @@ static void fp8_fp4_mega_moe(
     // mainloops; this controls the combine a2a only).
     const bool use_fp8_combine = get_env<int>("DG_USE_FP8_COMBINE") != 0;
     const bool use_fp8_acts = get_env<int>("DG_MEGA_MOE_USE_FP8_ACTS") != 0;
-    const bool use_blockwise_128 = get_env<int>("DG_MEGA_MOE_BLOCKWISE_128") != 0;
+    const bool use_blockwise_128 = get_env<int>("DG_MEGA_MOE_USE_BLOCK_WISE_FP8") != 0;
     DG_HOST_ASSERT(not use_blockwise_128 or (use_fp8_acts and not use_fp4_acts));
 
     // Dispatch into different architectures

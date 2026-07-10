@@ -66,7 +66,7 @@ template <
     // L2 epilogue write-back + combine-reduce read.
     bool kUseFp8Combine = false,
     bool kUseFp8Acts = false,
-    // ====== Blockwise 128 quantization — DG_MEGA_MOE_BLOCKWISE_128 ======
+    // ====== Blockwise 128 quantization — DG_MEGA_MOE_USE_BLOCK_WISE_FP8 ======
     // When true, the L1 epilogue quantizes SwiGLU outputs with per-128-K
     // granularity (4 consecutive per-32 groups share one UE8M0 SF). The
     // scheduler dispatches n_block pairs so both n_blocks needed for a
@@ -1327,10 +1327,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             // (matches the TMEM_LOAD_16dp256b1x layout mapping)
                             const uint32_t base_row = s * STORE_BLOCK_M + i * ATOM_M + (lane_idx % 4) * 2;
                             const uint32_t base_col = warp_idx_in_wg * 16 + (lane_idx / 4) * 2;
-                            smem_pair_float[base_row * L1_OUT_BLOCK_N + base_col] = swiglu_vals[0].x;
-                            smem_pair_float[(base_row + 1) * L1_OUT_BLOCK_N + base_col] = swiglu_vals[0].y;
-                            smem_pair_float[base_row * L1_OUT_BLOCK_N + base_col + 1] = swiglu_vals[1].x;
-                            smem_pair_float[(base_row + 1) * L1_OUT_BLOCK_N + base_col + 1] = swiglu_vals[1].y;
+                            *reinterpret_cast<float2*>(&smem_pair_float[base_row * L1_OUT_BLOCK_N + base_col]) =
+                                make_float2(swiglu_vals[0].x, swiglu_vals[1].x);
+                            *reinterpret_cast<float2*>(&smem_pair_float[(base_row + 1) * L1_OUT_BLOCK_N + base_col]) =
+                                make_float2(swiglu_vals[0].y, swiglu_vals[1].y);
                         }
 
                         // Cross-warp amax reduce + store to pair amax staging
@@ -1448,6 +1448,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         ptx::tma_store_wait<kNumTMAStoreStages - 1>();
                         ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
 
+                        float2 sf_inv_128_cache[kNumAtomsPerStore];
                         // Cross-warp reduce for second n_block + combine with first n_block's amax
                         #pragma unroll
                         for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
@@ -1480,18 +1481,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             float2 sf_128, sf_inv_128;
                             const float2 amax_for_sf = {amax_128_x, amax_128_y};
                             math::get_e4m3_sf_and_sf_inv(amax_for_sf, sf_128, sf_inv_128);
+                            sf_inv_128_cache[i] = sf_inv_128;
 
                             // ---- Quantize first n_block (from smem staging) ----
                             const uint32_t base_row_first = s * STORE_BLOCK_M + i * ATOM_M + (lane_idx % 4) * 2;
                             const uint32_t base_col_first = warp_idx_in_wg * 16 + (lane_idx / 4) * 2;
-                            const float2 first_upper = {
-                                smem_pair_float[base_row_first * L1_OUT_BLOCK_N + base_col_first] * sf_inv_128.x,
-                                smem_pair_float[(base_row_first + 1) * L1_OUT_BLOCK_N + base_col_first] * sf_inv_128.y
-                            };
-                            const float2 first_lower = {
-                                smem_pair_float[base_row_first * L1_OUT_BLOCK_N + base_col_first + 1] * sf_inv_128.x,
-                                smem_pair_float[(base_row_first + 1) * L1_OUT_BLOCK_N + base_col_first + 1] * sf_inv_128.y
-                            };
+                            const auto first_row0 = *reinterpret_cast<float2*>(&smem_pair_float[base_row_first * L1_OUT_BLOCK_N + base_col_first]);
+                            const auto first_row1 = *reinterpret_cast<float2*>(&smem_pair_float[(base_row_first + 1) * L1_OUT_BLOCK_N + base_col_first]);
+                            const float2 first_upper = {first_row0.x * sf_inv_128.x, first_row1.x * sf_inv_128.y};
+                            const float2 first_lower = {first_row0.y * sf_inv_128.x, first_row1.y * sf_inv_128.y};
                             const auto fp8x4_first = __nv_fp8x4_e4m3(make_float4(first_upper.x, first_upper.y, first_lower.x, first_lower.y));
 
                             // STSM for first n_block
@@ -1554,17 +1552,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         // STSM for second n_block — reuse the same per-128 SF computed above
                         #pragma unroll
                         for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
-                            // Recompute per-128 SF (identical to the first loop)
-                            const uint32_t atom_global_r = s * kNumAtomsPerStore + i;
-                            const float2 amax_first_wp0_r = smem_pair_amax[atom_global_r * 8 + 0 * 4 + (lane_idx % 4)];
-                            const float2 amax_first_wp1_r = smem_pair_amax[atom_global_r * 8 + 1 * 4 + (lane_idx % 4)];
-                            const float amax_128_x_r = cute::max(
-                                cute::max(amax_first_wp0_r.x, amax_first_wp1_r.x), amax_values_second[i].x);
-                            const float amax_128_y_r = cute::max(
-                                cute::max(amax_first_wp0_r.y, amax_first_wp1_r.y), amax_values_second[i].y);
-                            float2 sf_128_r, sf_inv_128_r;
-                            const float2 amax_for_sf_r = {amax_128_x_r, amax_128_y_r};
-                            math::get_e4m3_sf_and_sf_inv(amax_for_sf_r, sf_128_r, sf_inv_128_r);
+                            const float2 sf_inv_128_r = sf_inv_128_cache[i];
 
                             const float2 second_upper_2 = __fmul2_rn(swiglu_values_second[i * 2 + 0], sf_inv_128_r);
                             const float2 second_lower_2 = __fmul2_rn(swiglu_values_second[i * 2 + 1], sf_inv_128_r);

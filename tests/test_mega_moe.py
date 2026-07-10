@@ -136,7 +136,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             w_sf = deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, 32), num_groups)
             return w, w_sf
 
-        use_blockwise_128 = os.environ.get('DG_MEGA_MOE_BLOCKWISE_128', '0') != '0'
+        use_blockwise_128 = os.environ.get('DG_MEGA_MOE_USE_BLOCK_WISE_FP8', '0') != '0'
         if args.weight_dtype == 'fp8' and use_blockwise_128:
             cast_fn = cast_grouped_weights_to_fp8_blockwise128
         elif args.weight_dtype == 'fp8':
@@ -217,7 +217,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         allow_multiple_reduction=False,
     ) if is_legacy_loaded else None
 
-    use_blockwise_128 = os.environ.get('DG_MEGA_MOE_BLOCKWISE_128', '0') != '0'
+    use_blockwise_128 = os.environ.get('DG_MEGA_MOE_USE_BLOCK_WISE_FP8', '0') != '0'
     # Match baseline quantization granularity to the fused kernel's setting so
     # the comparison is apples-to-apples. When blockwise128 is on, the fused
     # kernel quantizes the L1 output per-128-K; the baseline must do the same
@@ -391,7 +391,7 @@ if __name__ == '__main__':
     parser.add_argument('--num-processes', type=int, default=8, help='Number of processes to spawn (default: 8)')
 
     # Model settings
-    parser.add_argument('--num-max-tokens-per-rank', type=int, default=8192, help='Number of maximum tokens per rank')
+    parser.add_argument('--num-max-tokens-per-rank', type=int, default=32, help='Number of maximum tokens per rank')
     parser.add_argument('--num-tokens', type=int, default=0, help='Number of tokens per rank (follow max minus removed if 0)')
     parser.add_argument('--num-max-removed-tokens', type=int, default=0, help='Maximum number of tokens to remove')
     parser.add_argument('--hidden', type=int, default=7168, help='Hidden size')
